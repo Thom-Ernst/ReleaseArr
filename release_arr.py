@@ -22,6 +22,44 @@ QBITTORRENT_PASSWORD = os.getenv("QBITTORRENT_PASSWORD", "adminadmin")
 DELAY_MINUTES = int(os.getenv("DELAY_MINUTES", "120"))
 FAKE_EXTENSIONS = [ext.strip().lower() for ext in os.getenv("FAKE_EXTENSIONS", ".exe,.iso,.scr,.bat").split(",")]
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
+FULL_SCAN_INTERVAL_MINUTES = int(os.getenv("FULL_SCAN_INTERVAL_MINUTES", "60"))
+# Releases published earlier than (air time - grace) are treated as fakes: a real release cannot exist before the episode aired.
+PRE_AIR_GRACE_MINUTES = int(os.getenv("PRE_AIR_GRACE_MINUTES", "0"))
+# When set, log every write (monitor toggles, queue removal, grabs, torrent deletion) instead of performing it.
+DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def pick_release(releases: List[Dict[str, Any]], air_date_utc: datetime) -> Optional[Dict[str, Any]]:
+    """Best release Sonarr would accept that was not published before the episode aired.
+
+    Old fakes seeded before the air date stay in the indexers' search results, so a plain
+    EpisodeSearch right after the air date can still grab one. Sonarr sorts decisions by
+    quality profile, custom format score and seeders; releaseWeight is that sort position
+    (lower is better).
+    """
+    cutoff = air_date_utc - timedelta(minutes=PRE_AIR_GRACE_MINUTES)
+    candidates = []
+    for r in releases:
+        if r.get("rejected") or not r.get("downloadAllowed", True):
+            continue
+        published = r.get("publishDate")
+        if not published:
+            continue
+        try:
+            if parse_utc(published) < cutoff:
+                logger.info(f"Skipping pre-air release: {r.get('title')} (published {published})")
+                continue
+        except ValueError:
+            continue
+        candidates.append(r)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda r: r.get("releaseWeight", 0))
+
 
 class SonarrClient:
     def __init__(self, url: str, api_key: str):
@@ -56,6 +94,9 @@ class SonarrClient:
     def update_episodes_monitor_status(self, episode_ids: List[int], monitored: bool) -> None:
         if not episode_ids:
             return
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] would set monitored={monitored} on {len(episode_ids)} episodes: {episode_ids}")
+            return
         url = f"{self.url}/api/v3/episode/monitor"
         data = {
             "episodeIds": episode_ids,
@@ -64,16 +105,50 @@ class SonarrClient:
         response = self.session.put(url, json=data)
         response.raise_for_status()
 
-    def search_episodes(self, episode_ids: List[int]) -> None:
-        if not episode_ids:
-            return
-        url = f"{self.url}/api/v3/command"
-        data = {
-            "name": "EpisodeSearch",
-            "episodeIds": episode_ids
-        }
-        response = self.session.post(url, json=data)
+    def get_episode(self, episode_id: int) -> Dict[str, Any]:
+        response = self.session.get(f"{self.url}/api/v3/episode/{episode_id}")
         response.raise_for_status()
+        return response.json()
+
+    def get_releases(self, episode_id: int) -> List[Dict[str, Any]]:
+        """Interactive-search results for one episode (slow: queries every indexer)."""
+        response = self.session.get(f"{self.url}/api/v3/release", params={"episodeId": episode_id}, timeout=180)
+        response.raise_for_status()
+        return response.json()
+
+    def grab_release(self, release: Dict[str, Any]) -> None:
+        response = self.session.post(
+            f"{self.url}/api/v3/release",
+            json={"guid": release["guid"], "indexerId": release["indexerId"]},
+            timeout=60,
+        )
+        response.raise_for_status()
+
+    def search_after_air(self, episode_ids: List[int]) -> None:
+        """Replacement for a plain EpisodeSearch: grab the best release published after the air date."""
+        now = datetime.now(timezone.utc)
+        for episode_id in episode_ids:
+            try:
+                ep = self.get_episode(episode_id)
+                air_str = ep.get("airDateUtc")
+                if not air_str:
+                    logger.info(f"Episode {episode_id} has no air date; leaving it to Sonarr's own RSS sync.")
+                    continue
+                air_date = parse_utc(air_str)
+                if now < air_date + timedelta(minutes=DELAY_MINUTES):
+                    logger.info(f"Episode {episode_id} has not aired yet; not searching.")
+                    continue
+                best = pick_release(self.get_releases(episode_id), air_date)
+                if not best:
+                    logger.info(f"No post-air release available yet for episode {episode_id}; RSS sync will pick one up.")
+                    continue
+                if DRY_RUN:
+                    logger.info(f"[DRY RUN] would grab '{best['title']}' from {best.get('indexer')} for episode {episode_id}")
+                    continue
+                self.grab_release(best)
+                logger.info(f"Grabbed '{best['title']}' from {best.get('indexer')} for episode {episode_id}")
+            except Exception as e:
+                logger.error(f"Search for episode {episode_id} failed: {e}")
 
     def get_torrent_categories(self) -> List[str]:
         url = f"{self.url}/api/v3/downloadclient"
@@ -91,19 +166,31 @@ class SonarrClient:
         return list(categories)
 
     def get_queue(self) -> List[Dict[str, Any]]:
+        # Sonarr pages the queue at 10 records by default; a long queue would otherwise look mostly absent.
         url = f"{self.url}/api/v3/queue"
-        response = self.session.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and "records" in data:
-            return data["records"]
-        return data
+        records: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            response = self.session.get(url, params={"page": page, "pageSize": 500})
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or "records" not in data:
+                return data
+            records.extend(data["records"])
+            if len(records) >= data.get("totalRecords", 0) or not data["records"]:
+                return records
+            page += 1
 
     def mark_download_failed(self, queue_id: int) -> None:
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] would remove queue item {queue_id} from client and blocklist it")
+            return
         url = f"{self.url}/api/v3/queue/{queue_id}"
         params = {
             "removeFromClient": "true",
-            "blocklist": "true"
+            "blocklist": "true",
+            # Sonarr's own auto-redownload would pick the best release without the pre-air filter.
+            "skipRedownload": "true"
         }
         response = self.session.delete(url, params=params)
         response.raise_for_status()
@@ -123,9 +210,17 @@ class QbitClient:
             self.is_logged_in = True
             return True
         except Exception as e:
-            logger.error(f"qBittorrent connection failed during login: {e}")
-            self.is_logged_in = False
-            return False
+            # With "bypass authentication for clients on localhost/whitelisted subnets" the login
+            # call can be refused while the rest of the API is open, so probe before giving up.
+            try:
+                self.client.app_version()
+                logger.info(f"qBittorrent login failed ({e}) but the API is reachable without it; continuing.")
+                self.is_logged_in = True
+                return True
+            except Exception:
+                logger.error(f"qBittorrent connection failed during login: {e}")
+                self.is_logged_in = False
+                return False
 
     def get_torrents(self) -> Any:
         return self.client.torrents_info()
@@ -134,6 +229,9 @@ class QbitClient:
         return self.client.torrents_files(torrent_hash=torrent_hash)
 
     def delete_torrent(self, torrent_hash: str) -> None:
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] would delete torrent {torrent_hash} from qBittorrent with its files")
+            return
         self.client.torrents_delete(delete_files=True, torrent_hashes=torrent_hash)
 
 def process_episodes(sonarr: SonarrClient, episodes: List[Dict[str, Any]], series_dict: Dict[int, Dict[str, Any]]) -> None:
@@ -196,8 +294,8 @@ def process_episodes(sonarr: SonarrClient, episodes: List[Dict[str, Any]], serie
             sonarr.update_episodes_monitor_status(episodes_to_monitor, True)
             logger.info(f"Successfully monitored {len(episodes_to_monitor)} episodes.")
             
-            logger.info("Triggering search for newly monitored episodes...")
-            sonarr.search_episodes(episodes_to_monitor)
+            logger.info("Searching for newly monitored episodes (post-air releases only)...")
+            sonarr.search_after_air(episodes_to_monitor)
         except Exception as e:
             logger.error(f"Failed to monitor or search episodes: {e}")
 
@@ -309,8 +407,8 @@ def process_qbittorrent(qbit: QbitClient, sonarr: SonarrClient) -> None:
                     sonarr.mark_download_failed(q_item["queue_id"])
                     
                     if q_item.get("episode_id"):
-                        logger.info("Triggering new search in Sonarr for the episode...")
-                        sonarr.search_episodes([q_item["episode_id"]])
+                        logger.info("Searching for a replacement (post-air releases only)...")
+                        sonarr.search_after_air([q_item["episode_id"]])
                 except Exception as e:
                     logger.error(f"Failed to mark torrent as failed in Sonarr: {e}")
             else:
@@ -341,6 +439,9 @@ def main():
     logger.info(f"Check interval: {CHECK_INTERVAL_MINUTES} minutes.")
     logger.info(f"Delay minutes after airtime: {DELAY_MINUTES}")
     logger.info(f"Fake extensions to look for: {FAKE_EXTENSIONS}")
+    logger.info(f"Full scan every {FULL_SCAN_INTERVAL_MINUTES} min; pre-air grace {PRE_AIR_GRACE_MINUTES} min")
+    if DRY_RUN:
+        logger.warning("DRY_RUN is on: nothing will be changed, actions are only logged.")
     
     # Initialize clients ONCE
     sonarr = SonarrClient(SONARR_URL, SONARR_API_KEY)
@@ -352,8 +453,9 @@ def main():
     # Schedule quick scans every X minutes (much lighter on the API)
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job, sonarr=sonarr, qbit=qbit, is_full_scan=False)
     
-    # Schedule a full scan once a day to ensure older series aren't left behind if they get edited
-    schedule.every().day.at("03:00").do(job, sonarr=sonarr, qbit=qbit, is_full_scan=True)
+    # The quick scan only sees -7/+14 days around now. New or far-future episodes arrive monitored,
+    # so run the full scan often enough that none stays grabbable for long.
+    schedule.every(FULL_SCAN_INTERVAL_MINUTES).minutes.do(job, sonarr=sonarr, qbit=qbit, is_full_scan=True)
     
     while True:
         schedule.run_pending()
